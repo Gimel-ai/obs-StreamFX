@@ -23,6 +23,7 @@
 #include <util/platform.h>
 #include "nvidia/cuda/nvidia-cuda-context-stack.hpp"
 #include "obs/gs/gs-helper.hpp"
+#include "obs/obs-tools.hpp"
 #include "utility.hpp"
 
 #define ST "Filter.Nvidia.FaceTracking"
@@ -37,18 +38,23 @@
 #define ST_ROI_STABILITY "Filter.Nvidia.FaceTracking.ROI.Stability"
 #define SK_ROI_STABILITY "ROI.Stability"
 
-void nvar_deleter(NvAR_FeatureHandle v)
+void ar_feature_deleter(NvAR_FeatureHandle v)
 {
 	filter::nvidia::face_tracking_factory::get()->get_ar()->destroy(v);
 }
 
 filter::nvidia::face_tracking_instance::face_tracking_instance(obs_data_t* settings, obs_source_t* self)
-	: obs::source_instance(settings, self), _width(), _height(), _up_to_date(false), _rt(), _cfg_roi_zoom(1.0),
-	  _cfg_roi_offset({0., 0.}), _cfg_roi_stability(1.0), _roi_center(), _roi_size(), _roi_geom(4, 1),
+	: obs::source_instance(settings, self), _width(), _height(), _up_to_date(false), _rt(),
+
+	  _cfg_roi_zoom(1.0), _cfg_roi_offset({0., 0.}), _cfg_roi_stability(1.0),
+
+	  _roi_center(), _roi_size(), _roi_geom(4, 1),
+
 	  _cuda(face_tracking_factory::get()->get_cuda()), _cuda_ctx(face_tracking_factory::get()->get_cuda_context()),
-	  _cuda_stream(), _cuda_mem(), _cuda_flush_cache(true), _ar(face_tracking_factory::get()->get_ar()),
-	  _ar_models_path(), _ar_tracker(), _ar_ready(false), _ar_bboxes_data(), _ar_bboxes(), _ar_bboxes_confidence(),
-	  _ar_image(), _ar_image_bgr(), _ar_image_temp()
+	  _cuda_stream(), _cuda_mem(), _cuda_flush_cache(true),
+
+	  _ar_library(face_tracking_factory::get()->get_ar()), _ar_loaded(false), _ar_feature(), _ar_bboxes_data(),
+	  _ar_bboxes(), _ar_bboxes_confidence(), _ar_image(), _ar_image_bgr(), _ar_image_temp()
 {
 	// Create rendertarget for parent source storage.
 	{
@@ -56,20 +62,10 @@ filter::nvidia::face_tracking_instance::face_tracking_instance(obs_data_t* setti
 		_rt       = std::make_shared<gs::rendertarget>(GS_RGBA, GS_ZS_NONE);
 	}
 
-	// Figure out where the AR SDK Models are stored.
-	{
-		std::filesystem::path models_path = _ar->get_ar_sdk_path();
-		models_path                       = models_path.append("models");
-		models_path                       = std::filesystem::absolute(models_path);
-		models_path.concat("\\");
-		_ar_models_path = models_path.string();
-	}
-
 	// Initialize everything.
 	{
 		auto cctx    = std::make_shared<::nvidia::cuda::context_stack>(_cuda, _cuda_ctx);
 		_cuda_stream = std::make_shared<::nvidia::cuda::stream>(_cuda);
-		face_detection_initialize();
 	}
 
 #ifdef _DEBUG
@@ -80,72 +76,108 @@ filter::nvidia::face_tracking_instance::face_tracking_instance(obs_data_t* setti
 	_profile_ar_transfer   = util::profiler::create();
 	_profile_ar_run        = util::profiler::create();
 #endif
+
+	// Asynchronously load Face Tracking.
+	async_initialize(nullptr);
 }
 
 filter::nvidia::face_tracking_instance::~face_tracking_instance()
 {
-	_ar->image_dealloc(&_ar_image_temp);
-	_ar->image_dealloc(&_ar_image_bgr);
+	_ar_library->image_dealloc(&_ar_image_temp);
+	_ar_library->image_dealloc(&_ar_image_bgr);
 }
 
-void filter::nvidia::face_tracking_instance::face_detection_initialize()
+void filter::nvidia::face_tracking_instance::async_initialize(std::shared_ptr<void> ptr)
 {
-	// Create
-	NvAR_FeatureHandle fd_inst;
-	if (NvCV_Status res = _ar->create(NvAR_Feature_FaceDetection, &fd_inst); res != NVCV_SUCCESS) {
-		throw std::runtime_error("Failed to create Face Detection feature.");
-	}
-	_ar_tracker = std::shared_ptr<nvAR_Feature>{fd_inst, nvar_deleter};
+	struct async_data {
+		std::shared_ptr<obs_weak_source_t> source;
+		std::string                        models_path;
+	};
+	if (!ptr) {
+		// Spawn the work for the threadpool.
+		std::shared_ptr<async_data> data = std::make_shared<async_data>();
+		data->source =
+			std::shared_ptr<obs_weak_source_t>(obs_source_get_weak_source(_self), obs::obs_weak_source_deleter);
 
-	// Configuration
-	if (NvCV_Status res = _ar->set_cuda_stream(fd_inst, NvAR_Parameter_Config(CUDAStream),
-											   reinterpret_cast<CUstream>(_cuda_stream->get()));
-		res != NVCV_SUCCESS) {
-		throw std::runtime_error("");
-	}
-	if (NvCV_Status res = _ar->set_string(fd_inst, NvAR_Parameter_Config(ModelDir), _ar_models_path.c_str());
-		res != NVCV_SUCCESS) {
-		throw std::runtime_error("");
-	}
-	if (NvCV_Status res = _ar->set_uint32(fd_inst, NvAR_Parameter_Config(Temporal), 1); res != NVCV_SUCCESS) {
-		throw std::runtime_error("");
-	}
+		std::filesystem::path models_path = _ar_library->get_ar_sdk_path();
+		models_path                       = models_path.append("models");
+		models_path                       = std::filesystem::absolute(models_path);
+		models_path.concat("\\");
+		data->models_path = models_path.string();
 
-	// Create Bounding Boxes Data
-	_ar_bboxes_data.assign(1, {0., 0., 0., 0.});
-	_ar_bboxes.boxes     = _ar_bboxes_data.data();
-	_ar_bboxes.max_boxes = std::clamp<std::uint8_t>(static_cast<std::uint8_t>(_ar_bboxes_data.size()), 0, 255);
-	_ar_bboxes.num_boxes = 0;
-	_ar_bboxes_confidence.resize(_ar_bboxes_data.size());
+		get_global_threadpool()->push(
+			std::bind(&filter::nvidia::face_tracking_instance::async_initialize, this, std::placeholders::_1), data);
+	} else {
+		std::shared_ptr<async_data> data = std::static_pointer_cast<async_data>(ptr);
 
-	if (NvCV_Status res =
-			_ar->set_object(_ar_tracker.get(), NvAR_Parameter_Output(BoundingBoxes), &_ar_bboxes, sizeof(NvAR_BBoxes));
-		res != NVCV_SUCCESS) {
-		throw std::runtime_error("Failed to set BoundingBoxes for Face Tracking feature.");
+		// Try and acquire a strong source reference.
+		std::shared_ptr<obs_source_t> ref =
+			std::shared_ptr<obs_source_t>(obs_weak_source_get_source(data->source.get()), obs::obs_source_deleter);
+
+		// If that failed, the source we are working for was deleted - abort now.
+		if (!ref) {
+			return;
+		}
+
+		// Update the current CUDA context for working.
+		auto cctx = std::make_shared<::nvidia::cuda::context_stack>(_cuda, _cuda_ctx);
+
+		// Create Face Detection feature.
+		{
+			NvAR_FeatureHandle fd_inst;
+			if (NvCV_Status res = _ar_library->create(NvAR_Feature_FaceDetection, &fd_inst); res != NVCV_SUCCESS) {
+				throw std::runtime_error("Failed to create Face Detection feature.");
+			}
+			_ar_feature = std::shared_ptr<nvAR_Feature>{fd_inst, ar_feature_deleter};
+		}
+
+		// Set the correct CUDA stream for processing.
+		if (NvCV_Status res = _ar_library->set_cuda_stream(_ar_feature.get(), NvAR_Parameter_Config(CUDAStream),
+														   reinterpret_cast<CUstream>(_cuda_stream->get()));
+			res != NVCV_SUCCESS) {
+			throw std::runtime_error("Failed to set CUDA stream.");
+		}
+
+		// Set the correct models path.
+		if (NvCV_Status res =
+				_ar_library->set_string(_ar_feature.get(), NvAR_Parameter_Config(ModelDir), data->models_path.c_str());
+			res != NVCV_SUCCESS) {
+			throw std::runtime_error("Unable to set model path.");
+		}
+
+		// Finally enable Temporal tracking if possible.
+		if (NvCV_Status res = _ar_library->set_uint32(_ar_feature.get(), NvAR_Parameter_Config(Temporal), 1);
+			res != NVCV_SUCCESS) {
+			LOG_WARNING("<%s> Unable to enable Temporal tracking mode.", obs_source_get_name(ref.get()));
+		}
+
+		// Create Bounding Boxes Data
+		_ar_bboxes_data.assign(1, {0., 0., 0., 0.});
+		_ar_bboxes.boxes     = _ar_bboxes_data.data();
+		_ar_bboxes.max_boxes = std::clamp<std::uint8_t>(static_cast<std::uint8_t>(_ar_bboxes_data.size()), 0, 255);
+		_ar_bboxes.num_boxes = 0;
+		_ar_bboxes_confidence.resize(_ar_bboxes_data.size());
+		if (NvCV_Status res = _ar_library->set_object(_ar_feature.get(), NvAR_Parameter_Output(BoundingBoxes),
+													  &_ar_bboxes, sizeof(NvAR_BBoxes));
+			res != NVCV_SUCCESS) {
+			throw std::runtime_error("Failed to set BoundingBoxes for Face Tracking feature.");
+		}
+		if (NvCV_Status res = _ar_library->set_float32_array(
+				_ar_feature.get(), NvAR_Parameter_Output(BoundingBoxesConfidence), _ar_bboxes_confidence.data(),
+				static_cast<int>(_ar_bboxes_confidence.size()));
+			res != NVCV_SUCCESS) {
+			throw std::runtime_error("Failed to set BoundingBoxesConfidence for Face Tracking feature.");
+		}
+
+		// And finally, load the feature (takes long).
+		if (NvCV_Status res = _ar_library->load(_ar_feature.get()); res != NVCV_SUCCESS) {
+			LOG_ERROR("<%s> Failed to load Face Tracking feature.", obs_source_get_name(_self));
+			_ar_loaded = false;
+			return;
+		} else {
+			_ar_loaded = true;
+		}
 	}
-
-	if (NvCV_Status res =
-			_ar->set_float32_array(_ar_tracker.get(), NvAR_Parameter_Output(BoundingBoxesConfidence),
-								   _ar_bboxes_confidence.data(), static_cast<int>(_ar_bboxes_confidence.size()));
-		res != NVCV_SUCCESS) {
-		throw std::runtime_error("Failed to set BoundingBoxesConfidence for Face Tracking feature.");
-	}
-
-	// Push to extra thread to not block OBS Studio.
-	obs_source_addref(_self);
-	::get_global_threadpool()->push(std::bind(&filter::nvidia::face_tracking_instance::face_detection_initialize_thread,
-											  this, std::placeholders::_1),
-									nullptr);
-}
-
-void filter::nvidia::face_tracking_instance::face_detection_initialize_thread(std::shared_ptr<void> param)
-{
-	auto cctx = std::make_shared<::nvidia::cuda::context_stack>(_cuda, _cuda_ctx);
-	if (NvCV_Status res = _ar->load(_ar_tracker.get()); res != NVCV_SUCCESS) {
-		_ar_fail = true;
-	}
-	_ar_ready = true;
-	obs_source_release(_self);
 }
 
 void filter::nvidia::face_tracking_instance::create_image_buffer(std::size_t width, std::size_t height)
@@ -155,15 +187,15 @@ void filter::nvidia::face_tracking_instance::create_image_buffer(std::size_t wid
 	// Create CUDA and AR interop.
 	std::size_t pitch = width * 4;
 	_cuda_mem         = std::make_shared<::nvidia::cuda::memory>(_cuda, pitch * height);
-	_ar->image_init(&_ar_image, static_cast<unsigned int>(width), static_cast<unsigned int>(height),
-					static_cast<int>(pitch), reinterpret_cast<void*>(_cuda_mem->get()), NVCV_RGBA, NVCV_U8,
-					NVCV_INTERLEAVED, NVCV_CUDA);
-	_ar->image_dealloc(&_ar_image_bgr);
-	_ar->image_alloc(&_ar_image_bgr, static_cast<unsigned int>(width), static_cast<unsigned int>(height), NVCV_BGR,
-					 NVCV_U8, NVCV_INTERLEAVED, NVCV_CUDA, 0);
+	_ar_library->image_init(&_ar_image, static_cast<unsigned int>(width), static_cast<unsigned int>(height),
+							static_cast<int>(pitch), reinterpret_cast<void*>(_cuda_mem->get()), NVCV_RGBA, NVCV_U8,
+							NVCV_INTERLEAVED, NVCV_CUDA);
+	_ar_library->image_dealloc(&_ar_image_bgr);
+	_ar_library->image_alloc(&_ar_image_bgr, static_cast<unsigned int>(width), static_cast<unsigned int>(height),
+							 NVCV_BGR, NVCV_U8, NVCV_INTERLEAVED, NVCV_CUDA, 0);
 
 	if (NvCV_Status res =
-			_ar->set_object(_ar_tracker.get(), NvAR_Parameter_Input(Image), &_ar_image_bgr, sizeof(NvCVImage));
+			_ar_library->set_object(_ar_feature.get(), NvAR_Parameter_Input(Image), &_ar_image_bgr, sizeof(NvCVImage));
 		res != NVCV_SUCCESS) {
 		throw std::runtime_error("_ar_tracker NvAR_Parameter_Input(Image)");
 	}
@@ -210,7 +242,7 @@ void filter::nvidia::face_tracking_instance::update(obs_data_t* data)
 
 void filter::nvidia::face_tracking_instance::video_tick(float_t seconds)
 {
-	if (!_ar_ready)
+	if (!_ar_loaded)
 		return;
 
 	// Update Buffers
@@ -242,7 +274,7 @@ void filter::nvidia::face_tracking_instance::video_render(gs_effect_t* effect)
 	obs_source_t*    filter_target  = obs_filter_get_target(_self);
 	gs_effect_t*     default_effect = obs_get_base_effect(OBS_EFFECT_DEFAULT);
 
-	if (!filter_parent || !filter_target || !_width || !_height || !_ar_ready) {
+	if (!filter_parent || !filter_target || !_width || !_height || !_ar_loaded) {
 		obs_source_skip_video_filter(_self);
 		return;
 	}
@@ -312,9 +344,9 @@ void filter::nvidia::face_tracking_instance::video_render(gs_effect_t* effect)
 #ifdef _DEBUG
 				auto prof = _profile_ar_transfer->track();
 #endif
-				if (NvCV_Status res =
-						_ar->image_transfer(&_ar_image, &_ar_image_bgr, 1.0,
-											reinterpret_cast<CUstream_st*>(_cuda_stream->get()), &_ar_image_temp);
+				if (NvCV_Status res = _ar_library->image_transfer(&_ar_image, &_ar_image_bgr, 1.0,
+																  reinterpret_cast<CUstream_st*>(_cuda_stream->get()),
+																  &_ar_image_temp);
 					res != NVCV_SUCCESS) {
 					obs_source_skip_video_filter(_self);
 					return;
@@ -325,7 +357,7 @@ void filter::nvidia::face_tracking_instance::video_render(gs_effect_t* effect)
 #ifdef _DEBUG
 				auto prof = _profile_ar_run->track();
 #endif
-				if (NvCV_Status res = _ar->run(_ar_tracker.get()); res != NVCV_SUCCESS) {
+				if (NvCV_Status res = _ar_library->run(_ar_feature.get()); res != NVCV_SUCCESS) {
 					obs_source_skip_video_filter(_self);
 					return;
 				}
@@ -428,6 +460,8 @@ void filter::nvidia::face_tracking_instance::video_render(gs_effect_t* effect)
 	}
 	gs_load_vertexbuffer(nullptr);
 }
+
+void filter::nvidia::face_tracking_instance::async_track(std::shared_ptr<void>) {}
 
 #ifdef _DEBUG
 bool filter::nvidia::face_tracking_instance::button_profile(obs_properties_t* props, obs_property_t* property)

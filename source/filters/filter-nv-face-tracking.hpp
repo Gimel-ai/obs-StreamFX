@@ -62,17 +62,17 @@ namespace filter::nvidia {
 		std::shared_ptr<::nvidia::cuda::gstexture> _cuda_rt_cache;
 
 		// Nvidia AR interop
-		std::shared_ptr<::nvidia::ar::ar> _ar;
-		std::string                       _ar_models_path;
-		std::shared_ptr<nvAR_Feature>     _ar_tracker;
-		std::atomic_bool                  _ar_ready;
-		std::atomic_bool                  _ar_fail;
-		std::vector<NvAR_Rect>            _ar_bboxes_data;
-		NvAR_BBoxes                       _ar_bboxes;
-		std::vector<float_t>              _ar_bboxes_confidence;
-		NvCVImage                         _ar_image;
-		NvCVImage                         _ar_image_bgr;
-		NvCVImage                         _ar_image_temp;
+		std::shared_ptr<::nvidia::ar::ar> _ar_library;
+		std::atomic_bool                  _ar_loaded;
+		std::shared_ptr<nvAR_Feature>     _ar_feature;
+
+		std::atomic_bool       _ar_fail;
+		std::vector<NvAR_Rect> _ar_bboxes_data;
+		NvAR_BBoxes            _ar_bboxes;
+		std::vector<float_t>   _ar_bboxes_confidence;
+		NvCVImage              _ar_image;
+		NvCVImage              _ar_image_bgr;
+		NvCVImage              _ar_image_temp;
 
 #ifdef _DEBUG
 		// Profiling
@@ -87,10 +87,10 @@ namespace filter::nvidia {
 		face_tracking_instance(obs_data_t*, obs_source_t*);
 		virtual ~face_tracking_instance() override;
 
-		// Initialize face detection.
-		void face_detection_initialize();
+		// Asynchronous work.
+		void async_initialize(std::shared_ptr<void>);
 
-		void face_detection_initialize_thread(std::shared_ptr<void> param);
+		void async_track(std::shared_ptr<void>);
 
 		// Create image buffer.
 		void create_image_buffer(std::size_t width, std::size_t height);
